@@ -25,6 +25,17 @@ import (
 %token <real> REAL_LITERAL
 %token <boolean> BOOLEAN_LITERAL
 %token UNDEFINED ERROR
+/* The magnitude 2^63 overflows a signed 64-bit int, so it is valid only as the
+   operand of a unary minus (yielding INT64_MIN). The lexer emits this token for
+   it; the grammar accepts it ONLY after '-'. A bare 2^63 has no rule and stays
+   a syntax error -- positive integer overflow, which the Go engine rejects
+   rather than wrapping to 0 the way libclassad does. */
+%token INT64_MIN_MAGNITUDE
+/* ELVIS is the adjacent "?:" operator. Unlike the spaced "? :" (which the
+   lexer leaves as two tokens and which binds at ternary precedence), it is a
+   high-precedence postfix operator alongside '.' and '[', matching the
+   reference parser (10 ?: 2 + 3 is (10 ?: 2) + 3). */
+%token ELVIS
 
 /* Operators - ordered by precedence (lowest to highest) */
 %left '?' ':'
@@ -39,16 +50,21 @@ import (
 %left '+' '-'
 %left '*' '/' '%'
 %right UNARY '!' '~'
+/* ELVIS is just below '.' / '[' so the elvis right operand greedily grabs a
+   trailing subscript/selection: (0) ?: {}[0] is (0) ?: ({}[0]), not
+   ((0) ?: {})[0], matching the reference parser's recursive postfix right. */
+%left ELVIS
 %left '.' '[' '('
 
 %type <classad> classad record_literal
 %type <attrs> attr_list
-%type <attr> attr_assign
+%type <attr> attr_assign attr_stmt
+%type <str> strings
 %type <expr> expr literal primary_expr postfix_expr unary_expr
 %type <expr> mult_expr add_expr shift_expr rel_expr eq_expr
 %type <expr> and_expr xor_expr or_expr logical_and_expr logical_or_expr
 %type <expr> cond_expr
-%type <exprlist> expr_list opt_expr_list
+%type <exprlist> expr_list opt_expr_list arg_list opt_arg_list
 
 %%
 
@@ -64,23 +80,28 @@ start
 classad
 	: '[' attr_list ']'
 		{ $$ = &ast.ClassAd{Attributes: $2} }
-	| '[' ']'
-		{ $$ = &ast.ClassAd{Attributes: []*ast.AttributeAssignment{}} }
 	;
 
 record_literal
 	: '[' attr_list ']'
 		{ $$ = &ast.ClassAd{Attributes: $2} }
-	| '[' ']'
-		{ $$ = &ast.ClassAd{Attributes: []*ast.AttributeAssignment{}} }
 	;
 
+/* Assignments are separated by ';', but empty statements are allowed anywhere
+   (leading, trailing, doubled, or a semicolon-only/empty body), matching the
+   reference parser: "[;a=1;;b=2;]" and "[ ; ]" and "[]" all parse. Two
+   assignments with no ';' between them ("[a=1 b=2]") is still an error. */
 attr_list
-	: attr_assign
-		{ $$ = []*ast.AttributeAssignment{$1} }
-	| attr_list ';' attr_assign
-		{ $$ = append($1, $3) }
-	| attr_list ';'
+	: attr_stmt
+		{ if $1 != nil { $$ = []*ast.AttributeAssignment{$1} } else { $$ = []*ast.AttributeAssignment{} } }
+	| attr_list ';' attr_stmt
+		{ if $3 != nil { $$ = append($1, $3) } else { $$ = $1 } }
+	;
+
+attr_stmt
+	: /* empty */
+		{ $$ = nil }
+	| attr_assign
 		{ $$ = $1 }
 	;
 
@@ -99,6 +120,8 @@ cond_expr
 		{ $$ = $1 }
 	| logical_or_expr '?' expr ':' cond_expr
 		{ $$ = &ast.ConditionalExpr{Condition: $1, TrueExpr: $3, FalseExpr: $5} }
+	| logical_or_expr '?' ':' cond_expr
+		{ $$ = &ast.ElvisExpr{Left: $1, Right: $4} }
 	;
 
 logical_or_expr
@@ -198,6 +221,8 @@ unary_expr
 		{ $$ = $1 }
 	| '-' unary_expr %prec UNARY
 		{ $$ = &ast.UnaryOp{Op: "-", Expr: $2} }
+	| '-' INT64_MIN_MAGNITUDE %prec UNARY
+		{ $$ = &ast.IntegerLiteral{Value: -9223372036854775808} }
 	| '+' unary_expr %prec UNARY
 		{ $$ = &ast.UnaryOp{Op: "+", Expr: $2} }
 	| '!' unary_expr
@@ -213,7 +238,9 @@ postfix_expr
 		{ $$ = &ast.SelectExpr{Record: $1, Attr: $3} }
 	| postfix_expr '[' expr ']'
 		{ $$ = &ast.SubscriptExpr{Container: $1, Index: $3} }
-	| IDENTIFIER '(' opt_expr_list ')'
+	| postfix_expr ELVIS postfix_expr
+		{ $$ = &ast.ElvisExpr{Left: $1, Right: $3} }
+	| IDENTIFIER '(' opt_arg_list ')'
 		{ $$ = &ast.FunctionCall{Name: $1, Args: $3} }
 	;
 
@@ -223,10 +250,17 @@ primary_expr
 	| IDENTIFIER
 		{
 			name, scope := ParseScopedIdentifier($1)
-			$$ = &ast.AttributeReference{Name: name, Scope: scope}
+			$$ = ast.NewAttributeReference(name, scope)
+		}
+	| '.' IDENTIFIER
+		{
+			// A leading-dot reference (".A") is a plain reference in the
+			// reference engine (".A" resolves identically to "A").
+			name, scope := ParseScopedIdentifier($2)
+			$$ = ast.NewAttributeReference(name, scope)
 		}
 	| '(' expr ')'
-		{ $$ = $2 }
+		{ $$ = ast.Parenthesize($2) }
 	| '{' opt_expr_list '}'
 		{ $$ = &ast.ListLiteral{Elements: $2} }
 	| record_literal
@@ -238,7 +272,7 @@ literal
 		{ $$ = &ast.IntegerLiteral{Value: $1} }
 	| REAL_LITERAL
 		{ $$ = &ast.RealLiteral{Value: $1} }
-	| STRING_LITERAL
+	| strings
 		{ $$ = &ast.StringLiteral{Value: $1} }
 	| BOOLEAN_LITERAL
 		{ $$ = &ast.BooleanLiteral{Value: $1} }
@@ -246,6 +280,14 @@ literal
 		{ $$ = &ast.UndefinedLiteral{} }
 	| ERROR
 		{ $$ = &ast.ErrorLiteral{} }
+	;
+
+/* Adjacent string literals concatenate, C-style: "a" "b" is "ab". */
+strings
+	: STRING_LITERAL
+		{ $$ = $1 }
+	| strings STRING_LITERAL
+		{ $$ = $1 + $2 }
 	;
 
 opt_expr_list
@@ -259,6 +301,26 @@ expr_list
 	: expr
 		{ $$ = []ast.Expr{$1} }
 	| expr_list ',' expr
+		{ $$ = append($1, $3) }
+	;
+
+/* Function-call arguments may be separated by ',' or ';' -- the reference
+   engine treats the two interchangeably (f(a;b) == f(a,b)), evaluating both to
+   the same value. (List literals, by contrast, accept only ','; "{1;2}" is a
+   syntax error in the reference too, so they keep using expr_list.) */
+opt_arg_list
+	: /* empty */
+		{ $$ = []ast.Expr{} }
+	| arg_list
+		{ $$ = $1 }
+	;
+
+arg_list
+	: expr
+		{ $$ = []ast.Expr{$1} }
+	| arg_list ',' expr
+		{ $$ = append($1, $3) }
+	| arg_list ';' expr
 		{ $$ = append($1, $3) }
 	;
 
