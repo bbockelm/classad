@@ -27,50 +27,51 @@ func asFloat(t *testing.T, v classad.Value) float64 {
 	return f
 }
 
-// TestCollectionAggregate covers sum/avg/min/max/count over a filtered
-// collection, the SELECT <op>(expr) WHERE <filter> primitive.
+// TestCollectionAggregate covers a batch of sum/avg/min/max/count over a
+// filtered collection computed in a single scan (SELECT ... WHERE).
 func TestCollectionAggregate(t *testing.T) {
 	c := New(Options{Shards: 4})
 	// Two "sites", each with slots of varying Cpus/Memory. SlotWeight is an
 	// EXPRESSION (Cpus + Memory/1024) to prove the aggregate evaluates it.
-	mustAdd(t, c, "a1", `[ Site="A"; Cpus=4; Memory=2048; SlotWeight=Cpus+Memory/1024 ]`) // weight 6
-	mustAdd(t, c, "a2", `[ Site="A"; Cpus=8; Memory=1024; SlotWeight=Cpus+Memory/1024 ]`) // weight 9
-	mustAdd(t, c, "b1", `[ Site="B"; Cpus=2; Memory=1024; SlotWeight=Cpus+Memory/1024 ]`) // weight 3
+	mustAdd(t, c, "a1", `[ Site="A"; Cpus=4; Memory=2048; SlotWeight=Cpus+Memory/1024 ]`)  // weight 6
+	mustAdd(t, c, "a2", `[ Site="A"; Cpus=8; Memory=1024; SlotWeight=Cpus+Memory/1024 ]`)  // weight 9
+	mustAdd(t, c, "b1", `[ Site="B"; Cpus=2; Memory=1024; SlotWeight=Cpus+Memory/1024 ]`)  // weight 3
 	mustAdd(t, c, "b2", `[ Site="B"; Cpus=16; Memory=4096; SlotWeight=Cpus+Memory/1024 ]`) // weight 20
 
 	siteA := mustQuery(t, `Site == "A"`)
 	weight := mustQuery(t, `SlotWeight`)
 	cpus := mustQuery(t, `Cpus`)
 
-	// Weighted pool size of site A = 6 + 9 = 15 (the exact accountant use case).
-	if got := asFloat(t, c.Aggregate(siteA, weight, "sum")); got != 15 {
-		t.Errorf("sum(SlotWeight) WHERE Site==A = %v, want 15", got)
+	// One pass over site A computing five aggregates at once.
+	got := c.Aggregate(siteA, []AggSpec{
+		{Op: "sum", Expr: weight}, // 6 + 9 = 15 (the accountant weighted-pool-size case)
+		{Op: "avg", Expr: cpus},   // (4+8)/2 = 6
+		{Op: "min", Expr: cpus},   // 4
+		{Op: "max", Expr: cpus},   // 8
+		{Op: "count"},             // 2 (expr nil is fine for count)
+	})
+	want := []float64{15, 6, 4, 8, 2}
+	if len(got) != len(want) {
+		t.Fatalf("got %d results, want %d", len(got), len(want))
 	}
-	// Total Cpus across the whole pool (nil filter) = 4+8+2+16 = 30.
-	if got := asFloat(t, c.Aggregate(nil, cpus, "sum")); got != 30 {
-		t.Errorf("sum(Cpus) over all = %v, want 30", got)
+	for i, w := range want {
+		if g := asFloat(t, got[i]); g != w {
+			t.Errorf("spec[%d] = %v, want %v", i, g, w)
+		}
 	}
-	// avg / min / max of Cpus in site A over {4,8}.
-	if got := asFloat(t, c.Aggregate(siteA, cpus, "avg")); got != 6 {
-		t.Errorf("avg(Cpus) WHERE Site==A = %v, want 6", got)
+
+	// nil filter aggregates over the whole pool: sum(Cpus) = 4+8+2+16 = 30.
+	all := c.Aggregate(nil, []AggSpec{{Op: "sum", Expr: cpus}, {Op: "count"}})
+	if g := asFloat(t, all[0]); g != 30 {
+		t.Errorf("sum(Cpus) over all = %v, want 30", g)
 	}
-	if got := asFloat(t, c.Aggregate(siteA, cpus, "min")); got != 4 {
-		t.Errorf("min(Cpus) WHERE Site==A = %v, want 4", got)
-	}
-	if got := asFloat(t, c.Aggregate(siteA, cpus, "max")); got != 8 {
-		t.Errorf("max(Cpus) WHERE Site==A = %v, want 8", got)
-	}
-	// count of site-A ads = 2; count over all = 4 (expr may be nil for count).
-	if got := asFloat(t, c.Aggregate(siteA, nil, "count")); got != 2 {
-		t.Errorf("count WHERE Site==A = %v, want 2", got)
-	}
-	if got := asFloat(t, c.Aggregate(nil, nil, "count")); got != 4 {
-		t.Errorf("count over all = %v, want 4", got)
+	if g := asFloat(t, all[1]); g != 4 {
+		t.Errorf("count over all = %v, want 4", g)
 	}
 }
 
 // TestCollectionAggregateEmptyAndErrors covers the edge semantics inherited from
-// the list aggregates.
+// the list aggregates, plus per-spec error isolation.
 func TestCollectionAggregateEmptyAndErrors(t *testing.T) {
 	c := New(Options{Shards: 2})
 	mustAdd(t, c, "x", `[ Site="A"; Cpus=4 ]`)
@@ -79,22 +80,32 @@ func TestCollectionAggregateEmptyAndErrors(t *testing.T) {
 	cpus := mustQuery(t, `Cpus`)
 
 	// sum over no ads is int 0; count is 0; min over no ads is undefined.
-	if got := asFloat(t, c.Aggregate(none, cpus, "sum")); got != 0 {
-		t.Errorf("sum over empty = %v, want 0", got)
+	empty := c.Aggregate(none, []AggSpec{{Op: "sum", Expr: cpus}, {Op: "count"}, {Op: "min", Expr: cpus}})
+	if g := asFloat(t, empty[0]); g != 0 {
+		t.Errorf("sum over empty = %v, want 0", g)
 	}
-	if got := asFloat(t, c.Aggregate(none, nil, "count")); got != 0 {
-		t.Errorf("count over empty = %v, want 0", got)
+	if g := asFloat(t, empty[1]); g != 0 {
+		t.Errorf("count over empty = %v, want 0", g)
 	}
-	if v := c.Aggregate(none, cpus, "min"); !v.IsUndefined() {
-		t.Errorf("min over empty = %v, want undefined", v)
+	if !empty[2].IsUndefined() {
+		t.Errorf("min over empty = %v, want undefined", empty[2])
 	}
-	// A nil expr for a numeric op is an error (only count allows nil expr).
-	if v := c.Aggregate(nil, nil, "sum"); !v.IsError() {
-		t.Errorf("sum with nil expr = %v, want error", v)
+
+	// Per-spec errors are isolated: a nil expr for a numeric op and an unknown op
+	// error only in their own slot; a valid spec beside them still computes.
+	mixed := c.Aggregate(nil, []AggSpec{
+		{Op: "sum"},                // nil expr -> error
+		{Op: "median", Expr: cpus}, // unknown op -> error
+		{Op: "sum", Expr: cpus},    // valid -> 4
+	})
+	if !mixed[0].IsError() {
+		t.Errorf("sum with nil expr = %v, want error", mixed[0])
 	}
-	// An unknown op is an error.
-	if v := c.Aggregate(nil, cpus, "median"); !v.IsError() {
-		t.Errorf("unknown op = %v, want error", v)
+	if !mixed[1].IsError() {
+		t.Errorf("unknown op = %v, want error", mixed[1])
+	}
+	if g := asFloat(t, mixed[2]); g != 4 {
+		t.Errorf("valid sum beside errors = %v, want 4", g)
 	}
 }
 
@@ -108,7 +119,8 @@ func TestCollectionAggregateScale(t *testing.T) {
 			want += float64(i % 8)
 		}
 	}
-	if got := asFloat(t, c.Aggregate(mustQuery(t, `Owner == "u0"`), mustQuery(t, `Cpus`), "sum")); got != want {
-		t.Errorf("sum(Cpus) WHERE Owner==u0 = %v, want %v", got, want)
+	got := c.Aggregate(mustQuery(t, `Owner == "u0"`), []AggSpec{{Op: "sum", Expr: mustQuery(t, `Cpus`)}})
+	if g := asFloat(t, got[0]); g != want {
+		t.Errorf("sum(Cpus) WHERE Owner==u0 = %v, want %v", g, want)
 	}
 }
