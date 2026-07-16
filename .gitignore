@@ -11,6 +11,10 @@
 # Output of the go coverage tool
 *.out
 
+# Raw condor_status dumps used to (re)generate the benchmark corpus. Only the
+# small gzipped corpus (collections/vm/testdata/pool_sample.ads.gz) is committed.
+*.ads
+
 # Dependency directories
 vendor/
 
@@ -31,3 +35,6 @@ y.output
 # Build output
 /bin/
 /dist/
+
+# large OSPool ad capture used by the match-perf spike (regenerate with condor_status -l)
+collections/testdata/ospool_slots.ldif

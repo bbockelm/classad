@@ -1,0 +1,231 @@
+package collections
+
+import (
+	"fmt"
+	"sort"
+	"testing"
+
+	"github.com/PelicanPlatform/classad/classad"
+	"github.com/PelicanPlatform/classad/collections/vm"
+)
+
+// buildIndexedCorpus makes a collection indexed on Arch/State/Owner (categorical)
+// and Cpus/Memory (value), populated with ads that span every extraction case:
+// plain literals, an expression-valued attr, a wrong-type attr, and an absent
+// attr. It returns the collection and the source ads keyed by their "ID" attr so a
+// test can compute the brute-force answer.
+func buildIndexedCorpus(t *testing.T) (*Collection, map[int]*classad.ClassAd) {
+	t.Helper()
+	c := New(Options{
+		Shards:           8,
+		CategoricalAttrs: []string{"Arch", "State", "Owner"},
+		ValueAttrs:       []string{"Cpus", "Memory"},
+	})
+	arches := []string{"X86_64", "x86_64", "aarch64", "ppc64le"}
+	states := []string{"Unclaimed", "Claimed", "Idle", "Owner"}
+	owners := []string{"alice", "bob", "carol", "dave"}
+	src := map[int]*classad.ClassAd{}
+	for i := 0; i < 400; i++ {
+		var text string
+		switch {
+		case i%37 == 0:
+			// Expression-valued indexed attrs -> exceptions.
+			text = fmt.Sprintf(`[ ID = %d; Arch = "%s"; State = "%s"; Owner = "%s"; Cpus = Base + 1; Memory = 1024 * %d ]`,
+				i, arches[i%len(arches)], states[i%len(states)], owners[i%len(owners)], (i%8)+1)
+		case i%41 == 0:
+			// Wrong-type / absent: Arch numeric, State missing.
+			text = fmt.Sprintf(`[ ID = %d; Arch = %d; Owner = "%s"; Cpus = %d; Memory = %d ]`,
+				i, i, owners[i%len(owners)], (i%8)+1, ((i%16)+1)*512)
+		default:
+			text = fmt.Sprintf(`[ ID = %d; Arch = "%s"; State = "%s"; Owner = "%s"; Cpus = %d; Memory = %d ]`,
+				i, arches[i%len(arches)], states[i%len(states)], owners[i%len(owners)], (i%8)+1, ((i%16)+1)*512)
+		}
+		ad, err := classad.Parse(text)
+		if err != nil {
+			t.Fatalf("parse ad %d: %v", i, err)
+		}
+		if err := c.Put([]byte(fmt.Sprintf("k%d", i)), ad); err != nil {
+			t.Fatal(err)
+		}
+		src[i] = ad
+	}
+	c.Reindex()
+	return c, src
+}
+
+func idOf(t *testing.T, ad *classad.ClassAd) int {
+	t.Helper()
+	v, ok := ad.EvaluateAttrInt("ID")
+	if !ok {
+		t.Fatalf("ad missing ID")
+	}
+	return int(v)
+}
+
+// queryIDs runs the collection query and returns the sorted set of matching IDs.
+func queryIDs(t *testing.T, c *Collection, q *vm.Query) []int {
+	var ids []int
+	for ad := range c.Query(q) {
+		ids = append(ids, idOf(t, ad))
+	}
+	sort.Ints(ids)
+	return ids
+}
+
+// bruteIDs is the ground truth: evaluate the query against every source ad.
+func bruteIDs(src map[int]*classad.ClassAd, q *vm.Query) []int {
+	var ids []int
+	for id, ad := range src {
+		if q.Matches(ad) {
+			ids = append(ids, id)
+		}
+	}
+	sort.Ints(ids)
+	return ids
+}
+
+func TestIndexMatchesFullScan(t *testing.T) {
+	t.Parallel()
+	c, src := buildIndexedCorpus(t)
+	queries := []string{
+		`Arch == "X86_64"`,                     // categorical equality (case-insensitive)
+		`State == "Unclaimed"`,                 // categorical equality
+		`Owner == "alice" || Owner == "carol"`, // set membership
+		`Arch != "aarch64"`,                    // categorical negation
+		`!(Owner == "bob")`,                    // negation normalized to !=
+		`Cpus >= 4`,                            // value range
+		`Memory > 4096`,                        // value range
+		`Cpus == 3`,                            // value equality
+		`Cpus != 5`,                            // value negation
+		`Memory > 2048 && Memory <= 6144`,      // two-sided range on one attr
+		`Cpus >= 2 && Arch == "X86_64" && Memory > 1024`, // multi-index AND
+		`Owner == "dave" && Cpus < 4`,                    // categorical + value AND
+		`Cpus > 1000`,                                    // no matches
+		`Rank > 5`,                                       // non-indexed attr -> full scan
+		`Cpus >= 2 && Nonexistent == "x"`,                // one indexed, one non-indexed
+		`Memory > 1024*3`,                                // constant folding
+		`Arch =?= "X86_64"`,                              // identity: case-sensitive, only the exact case
+		`Arch =?= "x86_64"`,                              // identity: the other case variant only
+		`Owner =?= "alice" || Owner =?= "bob"`,           // identity OR-chain -> membership
+		`Cpus =?= 3`,                                     // numeric identity
+		`Arch =!= "aarch64" && Cpus >= 2`,                // isnt (not indexed) alongside an indexed probe
+		`State =?= undefined`,                            // presence: absent categorical (i%41 drops State)
+		`State =!= undefined`,                            // presence: defined categorical
+		`Cpus =?= undefined`,                             // presence: value attr that evaluates undefined (exc)
+		`Cpus =!= undefined && Memory > 1024`,            // presence + value range
+		`isUndefined(State)`,                             // presence via function form
+		`!isUndefined(State) && Owner == "alice"`,        // negated function form + indexed eq
+		`Owner isnt undefined`,                           // presence: always-defined attr
+		`Arch =?= "X86_64"`,                              // exact identity: only the exact case
+		`Arch =!= "X86_64"`,                              // exact !=: MUST keep the "x86_64" variant
+		`Arch =!= "x86_64"`,                              // exact !=: MUST keep the "X86_64" variant
+		`Arch =!= "aarch64" && Owner =?= "bob"`,          // exact != and exact == together
+		// Disjunctive (DNF) queries: union of index candidate sets, re-verified.
+		`Cpus >= 6 || Owner == "alice"`,                                          // value-range OR categorical-eq
+		`(Cpus >= 6 && Arch == "X86_64") || State == "Claimed"`,                  // multi-probe group OR eq
+		`Owner == "alice" || Owner == "bob" || Memory > 6144`,                    // three disjuncts
+		`Memory > 4096 || State is undefined`,                                    // range OR presence
+		`Cpus >= 6 || Nonexistent == "x"`,                                        // one disjunct unindexed -> full scan
+		`Arch =!= "X86_64" || Cpus == 3`,                                         // exact-!= OR value-eq
+		`Arch == "X86_64" && (Cpus >= 6 || State == "Claimed")`,                  // nested OR -> DNF distribution
+		`(Owner == "alice" || Cpus >= 6) && (Arch == "X86_64" || Memory > 4096)`, // two nested ORs (cross product)
+	}
+	for _, qs := range queries {
+		q, err := vm.Parse(qs)
+		if err != nil {
+			t.Fatalf("parse query %q: %v", qs, err)
+		}
+		got := queryIDs(t, c, q)
+		want := bruteIDs(src, q)
+		if !equalInts(got, want) {
+			t.Errorf("query %q:\n  index got %d matches\n  brute   %d matches\n  got=%v\n  want=%v",
+				qs, len(got), len(want), got, want)
+		}
+	}
+}
+
+// TestMetaEqualsUsesIndex asserts the planner change directly: `=?=` (identity) is
+// planned as an indexed access path (like `==`), while `=!=` (isnt) is not indexed
+// and falls back to a scan. Correctness of both is covered by TestIndexMatchesFullScan.
+func TestMetaEqualsUsesIndex(t *testing.T) {
+	t.Parallel()
+	c, _ := buildIndexedCorpus(t)
+	cases := []struct {
+		query       string
+		wantIndexed bool
+	}{
+		{`Arch =?= "X86_64"`, true},           // exact identity on a categorical index
+		{`Cpus =?= 3`, true},                  // identity on a value index (planned as ==)
+		{`Arch == "X86_64"`, true},            // folded categorical equality
+		{`Arch =!= "aarch64"`, true},          // isnt vs literal: indexed via exact-case postings
+		{`Cpus =!= 3`, false},                 // numeric isnt: not indexed (int/real type-strictness)
+		{`State isnt undefined`, true},        // presence on a categorical index
+		{`State =?= undefined`, true},         // absence on a categorical index
+		{`Cpus =!= undefined`, true},          // presence on a value index
+		{`isUndefined(Owner)`, true},          // presence via function form
+		{`!isUndefined(Cpus)`, true},          // negated function form
+		{`Nonexistent isnt undefined`, false}, // presence on an unindexed attr -> scan
+	}
+	for _, tc := range cases {
+		q, err := vm.Parse(tc.query)
+		if err != nil {
+			t.Fatalf("parse %q: %v", tc.query, err)
+		}
+		ex := c.ExplainQuery(q)
+		gotIndexed := ex.Plan == "indexed"
+		if gotIndexed != tc.wantIndexed {
+			t.Errorf("query %q: plan=%q indexUsable=%d, want indexed=%v",
+				tc.query, ex.Plan, ex.IndexUsable, tc.wantIndexed)
+		}
+	}
+}
+
+// TestIsntEstimateMatchesNotEqual: on an always-defined categorical, `attr =!= v`
+// (isnt) must estimate the same selectivity as `attr != v` -- both exclude one value.
+// Regression for the estimator falling through to ~100% for isnt, which made a
+// selective NOPREEMPT-style `State =!= "Claimed"` sort last instead of first.
+func TestIsntEstimateMatchesNotEqual(t *testing.T) {
+	t.Parallel()
+	c := New(Options{Shards: 4, CategoricalAttrs: []string{"State"}})
+	for i := 0; i < 6000; i++ {
+		s := "Claimed"
+		if i%10 == 0 { // 10% Unclaimed
+			s = "Unclaimed"
+		}
+		if err := c.Put([]byte(fmt.Sprintf("m%d", i)), mustAd(t, fmt.Sprintf(`[ Id=%d; State=%q ]`, i, s))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c.Reindex()
+	est := func(qs string) float64 {
+		q, err := vm.Parse(qs)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ex := c.ExplainQuery(q)
+		if len(ex.Probes) != 1 || !ex.Probes[0].HasSelectivity {
+			t.Fatalf("%s: want one probe with selectivity, got %+v", qs, ex.Probes)
+		}
+		return ex.Probes[0].Selectivity
+	}
+	ne := est(`State != "Claimed"`)
+	isnt := est(`State =!= "Claimed"`)
+	if isnt > ne*1.5+0.02 { // isnt must not be wildly larger (it was ~1.0 vs ~0.1)
+		t.Errorf("=!= estimate %.3f should be close to != estimate %.3f (both exclude one value)", isnt, ne)
+	}
+	if isnt > 0.3 {
+		t.Errorf("=!= \"Claimed\" should be selective (~10%%), estimated %.3f", isnt)
+	}
+}
+
+func equalInts(a, b []int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
