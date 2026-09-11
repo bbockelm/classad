@@ -48,6 +48,13 @@ type DB struct {
 	// Truncate/Restore blocks every writer for the whole reload); surfaced via OpStats.
 	snapLockCount atomic.Int64
 	snapLockNanos atomic.Int64
+	// snapLockWait{Count,Nanos} accumulate how long COMMITTERS blocked acquiring the shared
+	// snapshot lock -- i.e. the time a Commit spent stalled behind an exclusive Truncate/Restore.
+	// SnapshotLock (above) measures only the holder's time, so without this a commit stalled
+	// behind a world-blocking op is attributable to nothing. Counted only when contended (see
+	// Commit's TryRLock), so the uncontended hot path pays no clock read.
+	snapLockWaitCount atomic.Int64
+	snapLockWaitNanos atomic.Int64
 }
 
 // lockSnapExclusive takes the DB-wide snapshot lock exclusively and returns a release
@@ -492,13 +499,17 @@ type OpStat = collections.OpStat
 type OpStats struct {
 	collections.OpStats
 	SnapshotLock OpStat `json:"snapshotLock"`
+	// SnapshotLockWait is the time committers spent BLOCKED on the shared snapshot lock (stalled
+	// behind an exclusive Truncate/Restore) -- the waiters' side of SnapshotLock's holder time.
+	SnapshotLockWait OpStat `json:"snapshotLockWait"`
 }
 
 // OpStats returns the store's operational timing counters (see the OpStats type).
 func (db *DB) OpStats() OpStats {
 	return OpStats{
-		OpStats:      db.c.OpStats(),
-		SnapshotLock: OpStat{Count: db.snapLockCount.Load(), Nanos: db.snapLockNanos.Load()},
+		OpStats:          db.c.OpStats(),
+		SnapshotLock:     OpStat{Count: db.snapLockCount.Load(), Nanos: db.snapLockNanos.Load()},
+		SnapshotLockWait: OpStat{Count: db.snapLockWaitCount.Load(), Nanos: db.snapLockWaitNanos.Load()},
 	}
 }
 
@@ -848,7 +859,16 @@ func (t *Txn) Commit() error {
 	// or Restore (exclusive) is atomic against them. A transaction whose snapshot predates
 	// a Truncate additionally conflicts via the shard gcFloor, so a stale write cannot land
 	// on the restored state even if it commits just after the exclusive section releases.
-	t.db.snapMu.RLock()
+	// TryRLock takes the uncontended fast path with no clock read (the overwhelming common case).
+	// It fails only when a Truncate/Restore holds -- or is waiting for -- the exclusive lock, so
+	// the timed blocking acquire runs precisely when this commit is stalled behind a world-blocking
+	// operation; that wait is otherwise recorded nowhere (SnapshotLock is the holder's time only).
+	if !t.db.snapMu.TryRLock() {
+		waitStart := time.Now()
+		t.db.snapMu.RLock()
+		t.db.snapLockWaitCount.Add(1)
+		t.db.snapLockWaitNanos.Add(int64(time.Since(waitStart)))
+	}
 	res := t.tx.Commit()
 	t.db.snapMu.RUnlock()
 	if res.Conflicted() {
