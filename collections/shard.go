@@ -160,9 +160,23 @@ func newShard(segSize int, onSync func()) *shard {
 // RAM segment. On a persistent-allocation error it records the sticky writeErr and
 // returns nil; the caller must treat the write as failed. Caller holds the write
 // lock.
+// allocFailHook is a test seam: when non-nil and it returns a non-nil error, segment allocation
+// fails with that error, simulating a disk-full (ENOSPC) or other write fault mid-operation. The
+// failure takes the same path a real allocator error does (sets sh.writeErr, surfaced to Put's
+// caller), so tests can exercise graceful handling deterministically. Nil in production.
+var allocFailHook func() error
+
 func (sh *shard) allocSeg(id uint32, size int, codec Codec) *segment {
 	start := time.Now()
 	defer func() { sh.metrics.segAlloc.observe(time.Since(start)) }()
+	if allocFailHook != nil {
+		if err := allocFailHook(); err != nil {
+			if sh.writeErr == nil {
+				sh.writeErr = err
+			}
+			return nil
+		}
+	}
 	if sh.alloc == nil {
 		s := newSegment(id, size, codec)
 		s.pinReap = sh.sealRAM // pin/reap-eligible so its anon sidecar tears down safely
