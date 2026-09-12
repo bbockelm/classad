@@ -287,9 +287,21 @@ func splitSegmentSidecarOld(data []byte) (attr, key, col, zone []byte, segUsed i
 	return nil, nil, nil, nil, 0, false
 }
 
+// writeFaultHook is a test seam: when non-nil and it returns a non-nil error for a given target
+// path, the rebuildable-metadata write to that path fails with that error, simulating a disk-full
+// (ENOSPC) at a specific site (sidecar / dir snapshot / dictionary). Keyed by path so a test can
+// fail exactly one site deterministically. Nil in production. Checked in writeFileAtomic (sidecars),
+// writeDirSnapshot, and writeDictFile.
+var writeFaultHook func(path string) error
+
 // writeFileAtomic writes b to path via a temp file + fsync + rename, so a crash never
 // leaves a torn sidecar.
 func writeFileAtomic(path string, b []byte) error {
+	if writeFaultHook != nil {
+		if err := writeFaultHook(path); err != nil {
+			return err
+		}
+	}
 	tmp := path + ".tmp"
 	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {

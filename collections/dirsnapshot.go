@@ -41,6 +41,11 @@ const (
 // never references not-yet-durable bytes. Best effort: an error just means the next
 // open falls back to a full scan.
 func writeDirSnapshot(sh *shard, shardDir string) error {
+	if writeFaultHook != nil {
+		if err := writeFaultHook(filepath.Join(shardDir, dirSnapName)); err != nil {
+			return err
+		}
+	}
 	// Segments are referenced by their file basename, which is stable across reopen;
 	// array indices are not (compaction leaves nil holes and reopen reloads without
 	// them). Assign each live (non-nil) segment a snapshot slot and record its
