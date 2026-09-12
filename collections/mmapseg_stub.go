@@ -30,6 +30,10 @@ func (s *segment) msyncRange(from, to int) error {
 	return errNoMmap
 }
 
+// isDurabilityFailure is unused on non-unix (no persistence, so msync never runs), but must exist
+// for the shared commit path to compile.
+func isDurabilityFailure(error) bool { return false }
+
 func (s *segment) reap() error {
 	if !s.persistent {
 		return nil

@@ -75,6 +75,11 @@ type shard struct {
 	allocNamed func(id uint32, size int, codec Codec, prefix string) (*segment, error)
 	segDir     string
 	writeErr   error
+	// syncErr is the first durability-sync (msync) failure, latched sticky and surfaced by
+	// writeError like writeErr -- so a commit whose data did not reach disk is not silently
+	// reported as durable. A per-commit syncPass runs the msyncs lock-free, so this is an atomic
+	// set-once rather than a mu-guarded field. Cleared by Truncate.
+	syncErr atomic.Pointer[syncFail]
 	// sealRAM, when true, makes this (in-memory) shard's RAM segments seal their sealed
 	// index to an anonymous mmap sidecar rather than keep it on the Go heap. It also makes
 	// those RAM segments participate in pin/reap (see segment.mapped): the anon mapping is
@@ -138,6 +143,9 @@ func (sh *shard) unlockWrite(acq, held time.Time) {
 	sh.metrics.writeWait.observe(held.Sub(acq))
 	sh.metrics.writeHold.observe(hold)
 }
+
+// syncFail boxes a latched durability-sync error so it can live in an atomic.Pointer.
+type syncFail struct{ err error }
 
 // supRef identifies a supersededBySeq field (a record's tombstone) that must be
 // flushed to disk for a persistent shard.
