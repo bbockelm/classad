@@ -143,6 +143,11 @@ func (r *dictReg) releaseEncodersExcept(keep Codec) {
 // writeDictFile writes a dictionary's bytes to path and fsyncs it (so a codec that
 // segments already reference cannot be lost across a crash).
 func writeDictFile(path string, dict []byte) error {
+	if writeFaultHook != nil {
+		if err := writeFaultHook(path); err != nil {
+			return err
+		}
+	}
 	// Recreate the dicts directory if it went missing at runtime. It is created at
 	// Open, but a retrain must not fail with ENOENT (open ".../dicts/N.zst: no such
 	// file or directory") just because the directory disappeared underneath us.
