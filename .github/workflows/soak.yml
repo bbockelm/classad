@@ -1,0 +1,67 @@
+name: Nightly soak
+
+# Scale + soak for the collections store: a large-record, sustained-concurrent-churn run that the
+# per-PR suite deliberately skips (it caps at a few thousand records to fit the race detector's
+# memory and the 25m budget). Runs nightly and on demand; TestScaleSoak is opt-in via CLASSAD_SOAK
+# so it never fires in the ordinary suite.
+on:
+  schedule:
+    - cron: '17 7 * * *' # ~07:17 UTC daily
+  workflow_dispatch:
+    inputs:
+      records:
+        description: 'CLASSAD_SOAK_N for the scale run'
+        default: '1000000'
+      seconds:
+        description: 'CLASSAD_SOAK_SECONDS for each run'
+        default: '240'
+
+jobs:
+  soak:
+    name: Scale + soak (collections)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+    - name: Check out code
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+    - name: Set up Go
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      with:
+        go-version: '1.25'
+
+    - name: Install goyacc
+      env:
+        GOTOOLCHAIN: auto
+      run: go install golang.org/x/tools/cmd/goyacc@latest
+
+    - name: Generate parser
+      run: |
+        export PATH=$PATH:$(go env GOPATH)/bin
+        goyacc -o parser/y.go -p yy parser/classad.y
+
+    - name: Build
+      working-directory: collections
+      run: |
+        go mod download
+        go build ./...
+
+    # Large scale, no race detector: exercise the eviction / pageable-key-index / segment-count /
+    # compaction machinery at ~1e6 records and assert correctness + bounded growth + recovery.
+    - name: Scale soak (large, no race)
+      working-directory: collections
+      env:
+        CLASSAD_SOAK: '1'
+        CLASSAD_SOAK_N: ${{ github.event.inputs.records || '1000000' }}
+        CLASSAD_SOAK_SECONDS: ${{ github.event.inputs.seconds || '240' }}
+      run: go test -run '^TestScaleSoak$' -count=1 -timeout 45m -v .
+
+    # Smaller scale, race detector on: catch concurrency bugs in the same churn that the large run
+    # can't afford the race detector's 5-10x memory to cover.
+    - name: Concurrency soak (race detector)
+      working-directory: collections
+      env:
+        CLASSAD_SOAK: '1'
+        CLASSAD_SOAK_N: '100000'
+        CLASSAD_SOAK_SECONDS: ${{ github.event.inputs.seconds || '240' }}
+      run: go test -race -run '^TestScaleSoak$' -count=1 -timeout 45m -v .
