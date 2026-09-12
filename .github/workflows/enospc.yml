@@ -1,0 +1,62 @@
+name: Nightly ENOSPC
+
+# Drives the persistent store against a real, tiny filesystem until it fills, exercising every
+# write path (segment allocation, msync writeback, sidecars, dict, snapshot) under actual ENOSPC.
+# Linux-only (needs a mountable size-limited filesystem); opt-in via CLASSAD_ENOSPC so it never
+# fires in the ordinary suite. Runs nightly and on demand.
+#
+# This validates the fallocate hardening: a full disk must be a clean fail-stop, not a SIGBUS or
+# silent data loss. If the test job crashes with a bus error, that is the regression it guards.
+on:
+  schedule:
+    - cron: '33 7 * * *' # ~07:33 UTC daily
+  workflow_dispatch:
+    inputs:
+      size_mb:
+        description: 'tmpfs size in MiB'
+        default: '48'
+
+jobs:
+  enospc:
+    name: Full-filesystem ENOSPC (collections)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+    - name: Check out code
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+    - name: Set up Go
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      with:
+        go-version: '1.25'
+
+    - name: Install goyacc
+      env:
+        GOTOOLCHAIN: auto
+      run: go install golang.org/x/tools/cmd/goyacc@latest
+
+    - name: Generate parser
+      run: |
+        export PATH=$PATH:$(go env GOPATH)/bin
+        goyacc -o parser/y.go -p yy parser/classad.y
+
+    - name: Mount a small tmpfs
+      run: |
+        sudo mkdir -p /mnt/enospc
+        sudo mount -t tmpfs -o size=${{ github.event.inputs.size_mb || '48' }}m tmpfs /mnt/enospc
+        sudo chmod 1777 /mnt/enospc
+        df -h /mnt/enospc
+
+    - name: Full-filesystem ENOSPC test
+      working-directory: collections
+      env:
+        CLASSAD_ENOSPC: '1'
+        CLASSAD_ENOSPC_DIR: /mnt/enospc
+        CLASSAD_ENOSPC_BUDGET_MB: '512' # safety cap; the 48 MiB tmpfs fills first
+      run: |
+        go mod download
+        go test -run '^TestENOSPCFullFilesystem$' -count=1 -timeout 15m -v .
+
+    - name: Unmount
+      if: always()
+      run: sudo umount /mnt/enospc || true
