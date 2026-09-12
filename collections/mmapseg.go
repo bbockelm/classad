@@ -3,6 +3,7 @@
 package collections
 
 import (
+	"errors"
 	"fmt"
 	"os"
 
@@ -74,12 +75,30 @@ func (s *segment) flush() error {
 	return nil
 }
 
+// msyncFailHook is a test seam: when non-nil and it returns a non-nil error, msyncRange fails with
+// that error instead of calling the syscall, simulating a durability-sync failure (e.g. EIO). Nil
+// in production.
+var msyncFailHook func() error
+
+// isDurabilityFailure reports whether an msync error means data did not reach disk (so a commit
+// must be treated as non-durable and fail-stopped) versus a benign/platform error like EINVAL
+// (which some platforms return for MS_SYNC ranges and which does not indicate data loss). Only the
+// former is latched into syncErr; latching EINVAL would wrongly wedge the store on such platforms.
+func isDurabilityFailure(err error) bool {
+	return errors.Is(err, unix.EIO) || errors.Is(err, unix.ENOSPC) || errors.Is(err, unix.EDQUOT)
+}
+
 // msyncRange flushes [from, to) of an mmap segment to disk (page-aligned start).
 // Used by group-commit durability, which advances synced under the shard lock and
 // then calls this lock-free. No-op for RAM segments.
 func (s *segment) msyncRange(from, to int) error {
 	if !s.persistent || to <= from {
 		return nil
+	}
+	if msyncFailHook != nil {
+		if err := msyncFailHook(); err != nil {
+			return err
+		}
 	}
 	const page = 4096
 	start := from &^ (page - 1)

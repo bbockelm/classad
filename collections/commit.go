@@ -259,8 +259,11 @@ func (sh *shard) syncPass() uint64 {
 	// whether stalls are "just an fsync thing". The unpin bookkeeping below is cheap and
 	// excluded.
 	syncStart := time.Now()
+	var serr error
 	for _, r := range ranges {
-		_ = r.seg.msyncRange(r.from, r.to)
+		if err := r.seg.msyncRange(r.from, r.to); serr == nil && isDurabilityFailure(err) {
+			serr = err
+		}
 	}
 	// Flush delete tombstones: the supersededBySeq field a delete wrote may sit in an
 	// already-synced region (so it is not covered by the append ranges above); msync
@@ -269,7 +272,14 @@ func (sh *shard) syncPass() uint64 {
 	// version regardless.
 	for _, s := range sup {
 		off := int(s.off) + recSupOff
-		_ = s.seg.msyncRange(off, off+8)
+		if err := s.seg.msyncRange(off, off+8); serr == nil && isDurabilityFailure(err) {
+			serr = err
+		}
+	}
+	// Latch the first durability-sync failure (set-once) so writeError surfaces it: a commit whose
+	// pages did not reach disk must not be silently reported as durable. Fail-stop, like writeErr.
+	if serr != nil {
+		sh.syncErr.CompareAndSwap(nil, &syncFail{serr})
 	}
 	sh.metrics.sync.observe(time.Since(syncStart))
 	for i := range ranges {

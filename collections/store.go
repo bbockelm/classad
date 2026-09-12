@@ -487,8 +487,9 @@ func (c *Collection) shardOf(key []byte, h uint64) int {
 	return int(c.h.Hash(c.rootKey(key)) & c.mask)
 }
 
-// writeError returns the first sticky segment-allocation error across shards
-// (persistent stores), or nil. Surfaced by Put/Update.
+// writeError returns the first sticky durability error across shards (persistent stores) -- a
+// segment-allocation failure (writeErr) or a durability-sync/msync failure (syncErr) -- or nil.
+// Surfaced by Put/Update so a caller learns a write did not land or did not reach disk.
 func (c *Collection) writeError() error {
 	if c.dir == "" {
 		return nil
@@ -499,6 +500,9 @@ func (c *Collection) writeError() error {
 		sh.mu.RUnlock()
 		if err != nil {
 			return err
+		}
+		if p := sh.syncErr.Load(); p != nil {
+			return p.err
 		}
 	}
 	return nil

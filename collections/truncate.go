@@ -36,6 +36,7 @@ func (c *Collection) Truncate() {
 			sh.childCount = make(map[uint64]int)
 		}
 		sh.writeErr = nil
+		sh.syncErr.Store(nil)
 		sh.mu.Unlock()
 		// Reap (munmap + unlink) outside the lock; retire() already deferred any still-
 		// pinned segment to its last unpin. reapAndHook (not bare reap) so a sealed
